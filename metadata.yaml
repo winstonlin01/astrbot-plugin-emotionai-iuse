@@ -1,5 +1,5 @@
-name: astrbot-plugin-emotionai
-desc: 高级情感智能交互系统 - 包含多维情感模拟和自适应学习能力
+name: astrbot_plugin_emotionai
+desc: EmotionAI 是一个基于 AstrBot 的高级情感智能交互插件，旨在为 AI 模拟一个多维度的、自主演变的内心世界。与传统的单一好感度系统不同，EmotionAI 提供了更丰富的情感维度和更智能的交互体验。
 help: |
   可用命令:
   - /好感度 - 查看当前情感状态
@@ -13,4 +13,5 @@ help: |
   - /重置插件 - 重置插件所有数据（不包括配置）
 version: v1.1.2
 author: 腾天
+
 repo: https://github.com/tengtian3/astrbot-plugin-emotionai
