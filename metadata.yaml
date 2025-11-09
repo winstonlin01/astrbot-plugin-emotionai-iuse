@@ -1,0 +1,17 @@
+name: astrbot_plugin_emotionai
+desc: EmotionAI 是一个基于 AstrBot 的高级情感智能交互插件，旨在为 AI 模拟一个多维度的、自主演变的内心世界。与传统的单一好感度系统不同，EmotionAI 提供了更丰富的情感维度和更智能的交互体验。
+help: |
+  可用命令:
+  - /好感度 - 查看当前情感状态
+  - /状态显示 - 切换是否在对话后显示状态信息
+  - /好感排行 [数量] - 显示好感度平均值前N名用户
+  - /负好感排行 [数量] - 显示好感度平均值后N名用户
+  
+  管理员命令:
+  - /设置好感 <用户ID> <数值> - 设置用户好感度
+  - /重置好感 <用户ID> - 重置用户好感度状态并移出黑名单
+  - /重置插件 - 重置插件所有数据（不包括配置）
+version: v1.1.3
+author: 腾天
+
+repo: https://github.com/tengtian3/astrbot-plugin-emotionai
