@@ -129,7 +129,7 @@ class DataMigrationManager:
 # ==================== 内部管理器类 ====================
 
 class UserStateManager:
-    """用户状态管理器"""
+    """用户状态管理器 - 添加并发控制"""
     
     def __init__(self, data_path: Path):
         self.data_path = data_path
@@ -138,6 +138,7 @@ class UserStateManager:
         self.dirty_keys = set()
         self.last_save_time = time.time()
         self.save_interval = 60
+        self.lock = asyncio.Lock()  # 添加异步锁
         
     def _load_data(self, filename: str) -> Dict[str, Any]:
         """加载数据文件"""
@@ -151,31 +152,34 @@ class UserStateManager:
         except (json.JSONDecodeError, TypeError):
             return {}
     
-    def get_user_state(self, user_key: str) -> EmotionalState:
-        """获取用户情感状态"""
-        if user_key in self.user_data:
-            return EmotionalState.from_dict(self.user_data[user_key])
-        return EmotionalState()
+    async def get_user_state(self, user_key: str) -> EmotionalState:
+        """获取用户情感状态 - 异步版本"""
+        async with self.lock:
+            if user_key in self.user_data:
+                return EmotionalState.from_dict(self.user_data[user_key])
+            return EmotionalState()
     
-    def update_user_state(self, user_key: str, state: EmotionalState):
-        """更新用户状态"""
-        self.user_data[user_key] = state.to_dict()
-        self.dirty_keys.add(user_key)
-        self._check_auto_save()
+    async def update_user_state(self, user_key: str, state: EmotionalState):
+        """更新用户状态 - 异步版本"""
+        async with self.lock:
+            self.user_data[user_key] = state.to_dict()
+            self.dirty_keys.add(user_key)
+        await self._check_auto_save()
     
-    def _check_auto_save(self):
-        """检查是否需要自动保存"""
+    async def _check_auto_save(self):
+        """检查是否需要自动保存 - 异步版本"""
         current_time = time.time()
         if (current_time - self.last_save_time >= self.save_interval and 
             self.dirty_keys):
-            self.force_save()
+            await self.force_save()
     
-    def force_save(self):
-        """强制保存所有脏数据"""
-        if self.dirty_keys:
-            self._save_data("user_emotion_data.json", self.user_data)
-            self.dirty_keys.clear()
-            self.last_save_time = time.time()
+    async def force_save(self):
+        """强制保存所有脏数据 - 异步版本"""
+        async with self.lock:
+            if self.dirty_keys:
+                self._save_data("user_emotion_data.json", self.user_data)
+                self.dirty_keys.clear()
+                self.last_save_time = time.time()
     
     def _save_data(self, filename: str, data: Dict[str, Any]):
         """保存数据到文件"""
@@ -183,11 +187,12 @@ class UserStateManager:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     
-    def clear_all_data(self):
-        """清空所有用户数据"""
-        self.user_data.clear()
-        self.dirty_keys.clear()
-        self.force_save()
+    async def clear_all_data(self):
+        """清空所有用户数据 - 异步版本"""
+        async with self.lock:
+            self.user_data.clear()
+            self.dirty_keys.clear()
+            self.force_save()
 
 
 class BlacklistManager:
@@ -350,14 +355,14 @@ class TTLCache:
 
 
 class RankingManager:
-    """排行榜管理器 - 带缓存优化"""
+    """排行榜管理器 - 优化性能"""
     
     def __init__(self, user_state_manager):
         self.user_state_manager = user_state_manager
         self.cache = TTLCache(default_ttl=60, max_size=10)  # 排行榜缓存60秒
     
     async def get_average_ranking(self, limit: int = 10, reverse: bool = True) -> List[RankingEntry]:
-        """获取好感度和亲密度的平均值排行榜 - 带缓存"""
+        """获取好感度和亲密度的平均值排行榜 - 优化版本"""
         cache_key = f"ranking_{limit}_{reverse}"
         
         # 尝试从缓存获取
@@ -365,11 +370,13 @@ class RankingManager:
         if cached_result:
             return cached_result
         
-        # 计算排行榜
+        # 计算排行榜 - 优化数据反序列化
         averages = []
         
+        # 直接使用字典数据，避免重复查找
         for user_key, data in self.user_state_manager.user_data.items():
-            state = self.user_state_manager.get_user_state(user_key)
+            # 直接从字典数据创建EmotionalState对象，避免重复查找
+            state = EmotionalState.from_dict(data)
             avg = (state.favor + state.intimacy) / 2
             averages.append((user_key, avg, state.favor, state.intimacy))
         
@@ -405,7 +412,7 @@ class RankingManager:
         return f"用户{user_key}"
     
     async def get_global_stats(self) -> Dict[str, Any]:
-        """获取全局统计信息 - 带缓存"""
+        """获取全局统计信息 - 优化版本"""
         cache_key = "global_stats"
         
         # 尝试从缓存获取
@@ -418,8 +425,9 @@ class RankingManager:
         avg_favor = 0
         avg_intimacy = 0
         
+        # 直接使用字典数据，避免重复查找
         for user_key, data in self.user_state_manager.user_data.items():
-            state = self.user_state_manager.get_user_state(user_key)
+            state = EmotionalState.from_dict(data)  # 优化：直接使用字典数据
             total_interactions += state.interaction_count
             avg_favor += state.favor
             avg_intimacy += state.intimacy
@@ -537,7 +545,7 @@ class UserCommandHandler:
             yield event.plain_result("【黑名单】您已加入黑名单，只有重置好感才可以移出黑名单。")
             return
             
-        state = self.plugin.user_manager.get_user_state(user_key)
+        state = await self.plugin.user_manager.get_user_state(user_key)
         response_text = self.plugin._format_emotional_state(state)
         yield event.plain_result(response_text)
     
@@ -549,9 +557,9 @@ class UserCommandHandler:
             yield event.plain_result("【黑名单】您已加入黑名单，只有重置好感才可以移出黑名单。")
             return
             
-        state = self.plugin.user_manager.get_user_state(user_key)
+        state = await self.plugin.user_manager.get_user_state(user_key)
         state.show_status = not state.show_status
-        self.plugin.user_manager.update_user_state(user_key, state)
+        await self.plugin.user_manager.update_user_state(user_key, state)
         
         status_text = "开启" if state.show_status else "关闭"
         yield event.plain_result(f"【状态显示】已{status_text}状态显示")
@@ -670,7 +678,7 @@ class AdminCommandHandler:
             
         # 管理员命令操作全局状态
         user_key = user_id
-        state = self.plugin.user_manager.get_user_state(user_key)
+        state = await self.plugin.user_manager.get_user_state(user_key)
         state.favor = favor_value
         
         # 如果设置的好感度高于下限，从黑名单中移除
@@ -679,7 +687,7 @@ class AdminCommandHandler:
             if removed:
                 logger.info(f"管理员将用户 {user_id} 移出黑名单，好感度设置为 {favor_value}")
         
-        self.plugin.user_manager.update_user_state(user_key, state)
+        await self.plugin.user_manager.update_user_state(user_key, state)
         
         # 更新缓存
         await self.plugin.cache.set(f"state_{user_key}", state)
@@ -703,7 +711,7 @@ class AdminCommandHandler:
         # 从黑名单中移除
         removed = self.plugin.blacklist_manager.remove_from_blacklist(user_key)
         
-        self.plugin.user_manager.update_user_state(user_key, new_state)
+        await self.plugin.user_manager.update_user_state(user_key, new_state)
         
         # 更新缓存
         await self.plugin.cache.set(f"state_{user_key}", new_state)
@@ -718,7 +726,7 @@ class AdminCommandHandler:
             return
             
         # 重置所有数据
-        self.plugin.user_manager.clear_all_data()
+        await self.plugin.user_manager.clear_all_data()
         self.plugin.blacklist_manager.clear_all_data()
         await self.plugin.cache.clear()
         
@@ -781,7 +789,7 @@ class AdminCommandHandler:
         
         # 管理员查看全局状态
         user_key = user_id
-        state = self.plugin.user_manager.get_user_state(user_key)
+        state = await self.plugin.user_manager.get_user_state(user_key)
         
         # 检查是否在黑名单中
         is_blacklisted = self.plugin.blacklist_manager.is_user_blacklisted(user_key)
@@ -917,7 +925,7 @@ class EmotionAIPlugin(Star):
         while True:
             try:
                 await asyncio.sleep(30)  # 每30秒检查一次
-                self.user_manager.force_save()
+                await self.user_manager.force_save()  # 使用异步版本
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1012,7 +1020,7 @@ class EmotionAIPlugin(Star):
         # 从缓存获取状态或从管理器获取
         state = await self.cache.get(f"state_{user_key}")
         if state is None:
-            state = self.user_manager.get_user_state(user_key)
+            state = await self.user_manager.get_user_state(user_key)
             await self.cache.set(f"state_{user_key}", state)
         
         # 构建增强的情感上下文
@@ -1064,7 +1072,7 @@ class EmotionAIPlugin(Star):
                 resp.completion_text = original_text.replace(emotion_block.group(0), '').strip()
         
         # 更新情感状态
-        state = self.user_manager.get_user_state(user_key)
+        state = await self.user_manager.get_user_state(user_key)
         self._apply_emotion_updates(state, emotion_updates)
         self._update_interaction_stats(state, emotion_updates)
         
@@ -1081,7 +1089,7 @@ class EmotionAIPlugin(Star):
         
         # 保存状态（只有在没有进入黑名单的情况下）
         if not self.blacklist_manager.is_user_blacklisted(user_key):
-            self.user_manager.update_user_state(user_key, state)
+            await self.user_manager.update_user_state(user_key, state)
             
             # 更新缓存
             await self.cache.set(f"state_{user_key}", state)
@@ -1164,41 +1172,36 @@ class EmotionAIPlugin(Star):
         # 更新关系状态
         state.relationship = self._calculate_relationship_level(state)
         
-    # ==================== 用户命令 ====================
+    # ==================== 用户命令 - 简化委托方式 ====================
     
     @filter.command("好感度")
     async def show_emotional_state(self, event: AstrMessageEvent):
         """显示情感状态"""
-        async for result in self.user_commands.show_emotional_state(event):
-            yield result
+        return self.user_commands.show_emotional_state(event)
         
     @filter.command("状态显示")
     async def toggle_status_display(self, event: AstrMessageEvent):
         """切换状态显示开关"""
-        async for result in self.user_commands.toggle_status_display(event):
-            yield result
+        return self.user_commands.toggle_status_display(event)
         
-    # ==================== 排行榜命令 ====================
+    # ==================== 排行榜命令 - 简化委托方式 ====================
     
     @filter.command("好感排行")
     async def show_favor_ranking(self, event: AstrMessageEvent, num: str = "10"):
         """显示好感度排行榜"""
-        async for result in self.user_commands.show_favor_ranking(event, num):
-            yield result
+        return self.user_commands.show_favor_ranking(event, num)
         
     @filter.command("负好感排行")
     async def show_negative_favor_ranking(self, event: AstrMessageEvent, num: str = "10"):
         """显示负好感排行榜"""
-        async for result in self.user_commands.show_negative_favor_ranking(event, num):
-            yield result
+        return self.user_commands.show_negative_favor_ranking(event, num)
         
-    # ==================== 新增命令 ====================
+    # ==================== 新增命令 - 简化委托方式 ====================
     
     @filter.command("情感分析")
     async def analyze_emotion(self, event: AstrMessageEvent, text: str = ""):
         """分析文本情感"""
-        async for result in self.user_commands.analyze_emotion(event, text):
-            yield result
+        return self.user_commands.analyze_emotion(event, text)
         
     @filter.command("缓存统计")
     async def show_cache_stats(self, event: AstrMessageEvent):
@@ -1218,7 +1221,7 @@ class EmotionAIPlugin(Star):
         
         yield event.plain_result("\n".join(response))
         
-    # ==================== 管理员命令 ====================
+    # ==================== 管理员命令 - 简化委托方式 ====================
     
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         """检查管理员权限"""
@@ -1227,38 +1230,32 @@ class EmotionAIPlugin(Star):
     @filter.command("设置好感")
     async def admin_set_favor(self, event: AstrMessageEvent, user_id: str, value: str):
         """设置好感度"""
-        async for result in self.admin_commands.set_favor(event, user_id, value):
-            yield result
+        return self.admin_commands.set_favor(event, user_id, value)
         
     @filter.command("重置好感")
     async def admin_reset_favor(self, event: AstrMessageEvent, user_id: str):
         """重置用户好感度状态"""
-        async for result in self.admin_commands.reset_favor(event, user_id):
-            yield result
+        return self.admin_commands.reset_favor(event, user_id)
         
     @filter.command("重置插件")
     async def admin_reset_plugin(self, event: AstrMessageEvent):
         """重置插件所有数据"""
-        async for result in self.admin_commands.reset_plugin(event):
-            yield result
+        return self.admin_commands.reset_plugin(event)
         
     @filter.command("黑名单统计")
     async def admin_blacklist_stats(self, event: AstrMessageEvent):
         """显示黑名单统计"""
-        async for result in self.admin_commands.blacklist_stats(event):
-            yield result
+        return self.admin_commands.blacklist_stats(event)
     
     @filter.command("查看好感")
     async def admin_view_favor(self, event: AstrMessageEvent, user_id: str):
         """管理员查看指定用户的好感状态"""
-        async for result in self.admin_commands.view_favor(event, user_id):
-            yield result
+        return self.admin_commands.view_favor(event, user_id)
         
     @filter.command("备份数据")
     async def admin_backup_data(self, event: AstrMessageEvent):
         """备份插件数据"""
-        async for result in self.admin_commands.backup_data(event):
-            yield result
+        return self.admin_commands.backup_data(event)
             
     def _create_backup(self) -> str:
         """创建数据备份"""
@@ -1292,5 +1289,5 @@ class EmotionAIPlugin(Star):
                 pass
                 
         # 强制保存所有数据
-        self.user_manager.force_save()
+        await self.user_manager.force_save()
         logger.info("EmotionAI 插件已安全关闭")
