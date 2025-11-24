@@ -1,5 +1,5 @@
 name: astrbot_plugin_emotionai
-version: v3.0.1
+version: v3.3.2
 author: 腾天
 desc: EmotionAI v3.0 搭载了全新的“认知共鸣引擎” (Cognitive Resonance Engine)。利用思维链 (CoT) 技术，让 AI 在回复前进行拟人化的心理活动推理，实现真正的情感代谢与自主决策。
 url: https://github.com/tengtian3/astrbot-plugin-emotionai
@@ -16,4 +16,5 @@ help: |
   - /设置情感 <ID> <维度> <值> - 上帝模式修改数值(如: /设置情感 123 愤怒 0)
   - /重置好感 <ID> - 一键重置并移除黑名单
   - /查看好感 <ID> - 偷看用户情感状态
+
   - /备份数据 - 手动触发数据持久化
