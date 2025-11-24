@@ -7,10 +7,19 @@ from typing import Dict, Any, Optional, List, Tuple
 import asyncio
 from dataclasses import dataclass, asdict
 
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register, StarTools
+# ==================== 核心导入 (保持 v3.3.1 稳定架构) ====================
+# 1. 事件相关：使用别名 event_filter 避免冲突
+from astrbot.api.event import filter as event_filter
+from astrbot.api.event import AstrMessageEvent
+
+# 2. 核心组件：从 api.all 导入
+from astrbot.api.all import Context, Star, register, AstrBotConfig, logger
+
+# 3. 辅助工具：从 api.star 导入
+from astrbot.api.star import StarTools
+
+# 4. LLM 相关
 from astrbot.api.provider import LLMResponse, ProviderRequest
-from astrbot.api import AstrBotConfig, logger
 
 
 # ==================== 数据结构定义 ====================
@@ -18,7 +27,6 @@ from astrbot.api import AstrBotConfig, logger
 @dataclass
 class EmotionalState:
     """情感状态数据类"""
-    # 基础情感维度
     joy: int = 0
     trust: int = 0
     fear: int = 0
@@ -27,32 +35,24 @@ class EmotionalState:
     disgust: int = 0
     anger: int = 0
     anticipation: int = 0
-    
-    # 高级情感维度
     pride: int = 0
     guilt: int = 0
     shame: int = 0
     envy: int = 0
     
-    # 复合状态
     favor: int = 0
     intimacy: int = 0
-    
-    # 关系状态
     relationship: str = "陌生人"
     attitude: str = "中立"
-    
-    # 黑名单状态
     is_blacklisted: bool = False
     
-    # 行为统计
     interaction_count: int = 0
     last_interaction: float = 0
     positive_interactions: int = 0
     negative_interactions: int = 0
     
-    # 用户设置
     show_status: bool = False
+    show_thought: bool = False 
     
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -78,24 +78,15 @@ class RankingEntry:
 class DataMigrationManager:
     @staticmethod
     def migrate_user_data(data: Dict[str, Any]) -> Dict[str, Any]:
+        """迁移用户数据到最新版本"""
         converted = {}
         for key, value in data.items():
             if isinstance(value, dict) and "emotions" in value:
                 state = EmotionalState()
                 if "emotions" in value:
                     emotions = value["emotions"]
-                    state.joy = emotions.get("joy", 0)
-                    state.trust = emotions.get("trust", 0)
-                    state.fear = emotions.get("fear", 0)
-                    state.surprise = emotions.get("surprise", 0)
-                    state.sadness = emotions.get("sadness", 0)
-                    state.disgust = emotions.get("disgust", 0)
-                    state.anger = emotions.get("anger", 0)
-                    state.anticipation = emotions.get("anticipation", 0)
-                    state.pride = emotions.get("pride", 0)
-                    state.guilt = emotions.get("guilt", 0)
-                    state.shame = emotions.get("shame", 0)
-                    state.envy = emotions.get("envy", 0)
+                    for k in ["joy", "trust", "fear", "surprise", "sadness", "disgust", "anger", "anticipation", "pride", "guilt", "shame", "envy"]:
+                        setattr(state, k, emotions.get(k, 0))
                 
                 if "states" in value:
                     states = value["states"]
@@ -116,6 +107,7 @@ class DataMigrationManager:
                 if "settings" in value:
                     settings = value["settings"]
                     state.show_status = settings.get("show_status", False)
+                    state.show_thought = settings.get("show_thought", False)
                 
                 converted[key] = state.to_dict()
             else:
@@ -125,72 +117,13 @@ class DataMigrationManager:
                         value[k] = v
                 converted[key] = value
         return converted
-    
+
     @staticmethod
     def get_data_version(data: Dict[str, Any]) -> str:
-        return "3.0.1"
+        return "3.3.2"
 
 
 # ==================== 内部管理器类 ====================
-
-class UserStateManager:
-    """用户状态管理器"""
-    
-    def __init__(self, data_path: Path):
-        self.data_path = data_path
-        self.data_path.mkdir(parents=True, exist_ok=True)
-        self.user_data = self._load_data("user_emotion_data.json")
-        self.dirty_keys = set()
-        self.last_save_time = time.time()
-        self.save_interval = 60
-        self.lock = asyncio.Lock()
-        
-    def _load_data(self, filename: str) -> Dict[str, Any]:
-        path = self.data_path / filename
-        if not path.exists(): return {}
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return DataMigrationManager.migrate_user_data(data)
-        except (json.JSONDecodeError, TypeError) as e:
-            logger.warning(f"数据加载异常: {e}")
-            return {}
-    
-    async def get_user_state(self, user_key: str) -> EmotionalState:
-        async with self.lock:
-            if user_key in self.user_data:
-                return EmotionalState.from_dict(self.user_data[user_key])
-            return EmotionalState()
-    
-    async def update_user_state(self, user_key: str, state: EmotionalState):
-        async with self.lock:
-            self.user_data[user_key] = state.to_dict()
-            self.dirty_keys.add(user_key)
-        await self._check_auto_save()
-    
-    async def _check_auto_save(self):
-        current_time = time.time()
-        if (current_time - self.last_save_time >= self.save_interval and self.dirty_keys):
-            await self.force_save()
-    
-    async def force_save(self):
-        async with self.lock:
-            if self.dirty_keys:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self._save_data, "user_emotion_data.json", self.user_data)
-                self.dirty_keys.clear()
-                self.last_save_time = time.time()
-    
-    def _save_data(self, filename: str, data: Dict[str, Any]):
-        path = self.data_path / filename
-        temp_path = path.with_suffix('.tmp')
-        try:
-            with open(temp_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            temp_path.replace(path)
-        except Exception as e:
-            logger.error(f"保存数据失败: {e}")
-
 
 class TTLCache:
     def __init__(self, default_ttl: int = 300, max_size: int = 1000):
@@ -230,11 +163,78 @@ class TTLCache:
     async def get_stats(self) -> Dict[str, Any]:
         async with self.lock:
             hit_rate = (self.hit_count / self.access_count * 100) if self.access_count > 0 else 0
-            return {"total_entries": len(self.cache), "access_count": self.access_count, "hit_count": self.hit_count, "hit_rate": round(hit_rate, 2)}
+            return {
+                "total_entries": len(self.cache),
+                "access_count": self.access_count,
+                "hit_count": self.hit_count,
+                "hit_rate": round(hit_rate, 2)
+            }
     
     async def clear(self):
         async with self.lock:
             self.cache.clear()
+
+
+class UserStateManager:
+    def __init__(self, data_path: Path, cache: TTLCache = None):
+        self.data_path = data_path
+        self.data_path.mkdir(parents=True, exist_ok=True)
+        self.user_data = self._load_data("user_emotion_data.json")
+        self.dirty_keys = set()
+        self.last_save_time = time.time()
+        self.save_interval = 60
+        self.lock = asyncio.Lock()
+        self.cache = cache
+        
+    def _load_data(self, filename: str) -> Dict[str, Any]:
+        path = self.data_path / filename
+        if not path.exists(): return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return DataMigrationManager.migrate_user_data(data)
+        except Exception as e:
+            logger.warning(f"数据加载异常: {e}")
+            return {}
+    
+    async def get_user_state(self, user_key: str) -> EmotionalState:
+        async with self.lock:
+            if user_key in self.user_data:
+                return EmotionalState.from_dict(self.user_data[user_key])
+            return EmotionalState()
+    
+    async def update_user_state(self, user_key: str, state: EmotionalState):
+        async with self.lock:
+            self.user_data[user_key] = state.to_dict()
+            self.dirty_keys.add(user_key)
+            
+        if self.cache:
+            await self.cache.set(f"state_{user_key}", state)
+            
+        await self._check_auto_save()
+    
+    async def _check_auto_save(self):
+        current_time = time.time()
+        if (current_time - self.last_save_time >= self.save_interval and self.dirty_keys):
+            await self.force_save()
+    
+    async def force_save(self):
+        async with self.lock:
+            if self.dirty_keys:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self._save_data, "user_emotion_data.json", self.user_data)
+                self.dirty_keys.clear()
+                self.last_save_time = time.time()
+    
+    def _save_data(self, filename: str, data: Dict[str, Any]):
+        path = self.data_path / filename
+        temp_path = path.with_suffix('.tmp')
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            temp_path.replace(path)
+        except Exception as e:
+            logger.error(f"保存数据失败: {e}")
 
 
 class RankingManager:
@@ -283,7 +283,13 @@ class RankingManager:
             avg_intimacy = sum(EmotionalState.from_dict(d).intimacy for d in users) / total_users
             blacklisted_count = sum(1 for d in users if EmotionalState.from_dict(d).is_blacklisted)
         
-        stats = {"total_users": total_users, "total_interactions": total_interactions, "average_favor": round(avg_favor, 2), "average_intimacy": round(avg_intimacy, 2), "blacklisted_count": blacklisted_count}
+        stats = {
+            "total_users": total_users,
+            "total_interactions": total_interactions,
+            "average_favor": round(avg_favor, 2),
+            "average_intimacy": round(avg_intimacy, 2),
+            "blacklisted_count": blacklisted_count
+        }
         await self.cache.set(cache_key, stats, ttl=30)
         return stats
 
@@ -312,16 +318,21 @@ class EmotionAnalyzer:
     
     @classmethod
     def get_dominant_emotions(cls, state: EmotionalState, count: int = 2) -> List[Tuple[str, int]]:
+        """获取主导情感（返回前N个）"""
         emotions = {k: getattr(state, k) for k in cls.EMOTION_DISPLAY_NAMES.keys()}
         return sorted([(k, v) for k, v in emotions.items() if v > 0], key=lambda x: x[1], reverse=True)[:count]
     
     @classmethod
     def get_emotional_profile(cls, state: EmotionalState) -> Dict[str, Any]:
+        """获取完整的情感档案"""
         top_emotions = cls.get_dominant_emotions(state, 2)
-        dominant_emotion = cls.EMOTION_DISPLAY_NAMES.get(top_emotions[0][0], "中立") if top_emotions else "中立"
-        intensity = top_emotions[0][1] if top_emotions else 0
         
-        # 2. 次要情感（用于混合情感分析）
+        dominant_emotion = "中立"
+        dominant_key = None
+        if top_emotions:
+            dominant_key = top_emotions[0][0]
+            dominant_emotion = cls.EMOTION_DISPLAY_NAMES.get(dominant_key, "中立")
+            
         secondary_emotion = None
         secondary_key = None
         if len(top_emotions) > 1:
@@ -329,6 +340,8 @@ class EmotionAnalyzer:
             if top_emotions[1][1] > top_emotions[0][1] * 0.3:
                 secondary_emotion = cls.EMOTION_DISPLAY_NAMES.get(secondary_key, "")
 
+        intensity = top_emotions[0][1] if top_emotions else 0
+        
         all_vals = [getattr(state, k) for k in cls.EMOTION_DISPLAY_NAMES.keys()]
         total_intensity = min(100, sum(all_vals) // 2)
         
@@ -341,7 +354,7 @@ class EmotionAnalyzer:
             
         return {
             "dominant_emotion": dominant_emotion,
-            "dominant_key": top_emotions[0][0] if top_emotions else None,
+            "dominant_key": dominant_key,
             "secondary_emotion": secondary_emotion,
             "secondary_key": secondary_key,
             "emotion_intensity": intensity,
@@ -373,6 +386,14 @@ class UserCommandHandler:
         state.show_status = not state.show_status
         await self.plugin.user_manager.update_user_state(user_key, state)
         yield event.plain_result(f"【状态显示】已{'开启' if state.show_status else '关闭'}")
+        event.stop_event()
+    
+    async def toggle_thought_display(self, event: AstrMessageEvent):
+        user_key = self.plugin._get_user_key(event)
+        state = await self.plugin.user_manager.get_user_state(user_key)
+        state.show_thought = not state.show_thought
+        await self.plugin.user_manager.update_user_state(user_key, state)
+        yield event.plain_result(f"【心理显示】已{'开启' if state.show_thought else '关闭'}（仅对自己生效）")
         event.stop_event()
     
     async def show_favor_ranking(self, event: AstrMessageEvent, num: str = "10"):
@@ -460,7 +481,6 @@ class AdminCommandHandler:
         if target_key == "favor" and val > self.plugin.favour_min: state.is_blacklisted = False
             
         await self.plugin.user_manager.update_user_state(user_key, state)
-        await self.plugin.cache.set(f"state_{user_key}", state)
         yield event.plain_result(f"【成功】{user_input} 的 [{dimension}] 已设为 {val}")
         event.stop_event()
     
@@ -468,8 +488,9 @@ class AdminCommandHandler:
         if not self.plugin._is_admin(event): return
         user_key = self._resolve_user_key(user_input)
         new_state = EmotionalState()
+        new_state.is_blacklisted = False
+        
         await self.plugin.user_manager.update_user_state(user_key, new_state)
-        await self.plugin.cache.set(f"state_{user_key}", new_state)
         yield event.plain_result(f"【成功】{user_input} 情感已重置")
         event.stop_event()
     
@@ -492,7 +513,7 @@ class AdminCommandHandler:
 
 # ==================== 主插件类 ====================
 
-@register("EmotionAI", "腾天", "高级情感智能交互系统 v3.0", "3.0.1")
+@register("EmotionAI", "腾天", "高级情感智能交互系统 v3.3", "3.3.2")
 class EmotionAIPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -500,7 +521,8 @@ class EmotionAIPlugin(Star):
         self._validate_and_init_config()
         
         data_dir = StarTools.get_data_dir() / "emotionai"
-        self.user_manager = UserStateManager(data_dir)
+        self.cache = TTLCache(default_ttl=300, max_size=500)
+        self.user_manager = UserStateManager(data_dir, self.cache)
         self.ranking_manager = RankingManager(self.user_manager)
         self.analyzer = EmotionAnalyzer()
         self.migration_manager = DataMigrationManager()
@@ -508,16 +530,15 @@ class EmotionAIPlugin(Star):
         self.CN_TO_EN_MAP = {v: k for k, v in EmotionAnalyzer.EMOTION_DISPLAY_NAMES.items()}
         self.CN_TO_EN_MAP.update({"好感": "favor", "好感度": "favor", "亲密": "intimacy", "亲密度": "intimacy", "骄傲": "pride", "愧疚": "guilt", "羞耻": "shame"})
         
-        self.cache = TTLCache(default_ttl=300, max_size=500)
         self.user_commands = UserCommandHandler(self)
         self.admin_commands = AdminCommandHandler(self)
         
-        self.emotion_pattern = re.compile(r"\[情感更新:\s*(.*?)\]", re.DOTALL)
+        # 正则初始化
+        self.emotion_pattern = re.compile(r"\[(?:\s*情感更新:)?\s*(.*?)\]", re.DOTALL)
         self.single_emotion_pattern = re.compile(r"(\w+|[\u4e00-\u9fa5]+):\s*([+-]?\d+)")
-        self.thought_pattern = re.compile(r"<thought>.*?</thought>", re.DOTALL)
         
         self.auto_save_task = asyncio.create_task(self._auto_save_loop())
-        logger.info("EmotionAI v3.0.1 (Cognitive Resonance Engine) Loaded")
+        logger.info("EmotionAI v3.3.2 (Cognitive Resonance Engine) Loaded")
         
     def _validate_and_init_config(self):
         self.session_based = bool(self.config.get("session_based", False))
@@ -579,9 +600,33 @@ class EmotionAIPlugin(Star):
         days = (time.time() - state.last_interaction) / 86400
         return "频繁" if days < 1 else "经常" if days < 3 else "偶尔" if days < 7 else "稀少"
 
-    # ==================== 核心逻辑 (V3.0.1 修复版) ====================
+    # ==================== 核心逻辑 ====================
     
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=1000000)
+    def _is_admin(self, event: AstrMessageEvent) -> bool:
+        """检查是否为管理员"""
+        return event.role == "admin" or event.get_sender_id() in self.admin_qq_list
+
+    def _create_backup(self) -> str:
+        """创建数据备份"""
+        data_dir = StarTools.get_data_dir() / "emotionai"
+        backup_dir = data_dir / "backups"
+        backup_dir.mkdir(exist_ok=True)
+        
+        timestamp = int(time.time())
+        backup_name = f"emotionai_backup_{timestamp}"
+        backup_path = backup_dir / backup_name
+        
+        backup_path.mkdir(exist_ok=True)
+        
+        for filename in ["user_emotion_data.json"]:
+            src = data_dir / filename
+            if src.exists():
+                dst = backup_path / filename
+                shutil.copy2(src, dst)
+        
+        return str(backup_path.relative_to(data_dir))
+
+    @event_filter.event_message_type(event_filter.EventMessageType.ALL, priority=1000000)
     async def check_blacklist(self, event: AstrMessageEvent):
         if self._is_admin(event):
             msg = event.message_str.strip()
@@ -593,10 +638,11 @@ class EmotionAIPlugin(Star):
             yield event.plain_result("您已加入黑名单，请联系管理员移除")
             event.stop_event()
 
-    @filter.on_llm_request(priority=100000)
+    @event_filter.on_llm_request(priority=100000)
     async def inject_emotional_context(self, event: AstrMessageEvent, req: ProviderRequest):
         user_key = self._get_user_key(event)
-        state = await self.cache.get(f"state_{user_key}") or await self.user_manager.get_user_state(user_key)
+        # [关键] 强制从 user_manager 获取最新状态，不完全依赖缓存，防止配置更新延迟
+        state = await self.user_manager.get_user_state(user_key)
         await self.cache.set(f"state_{user_key}", state)
         req.system_prompt += f"\n{self._build_cognitive_context(state)}"
 
@@ -615,10 +661,6 @@ class EmotionAIPlugin(Star):
             else:
                 tone_instruction = f"【语气要求】{tone_msg} {primary_inst}"
 
-        # [核心修改 v3.0.1] 
-        # 1. 显式列出所有非零情感数值，让 LLM 看到"已有的愤怒"。
-        # 2. 明确指示 LLM：如果现在的互动（正向）抵消了旧情绪（负向），必须输出负值。
-        
         active_emotions = []
         for k in EmotionAnalyzer.EMOTION_DISPLAY_NAMES.keys():
             val = getattr(state, k)
@@ -631,69 +673,98 @@ class EmotionAIPlugin(Star):
         return f"""
 【情感与认知状态】
 当前关系：{state.relationship} | 态度：{state.attitude}
-综合好感度：{state.favor} | 亲密度：{state.intimacy}
+好感度：{state.favor} | 亲密度：{state.intimacy}
 主导情感：{profile['dominant_emotion']} (强度{profile['emotion_intensity']}%)
 **当前详细面板**：{emotion_status_str}
 
 {tone_instruction}
 
 【核心指令：认知共鸣引擎】
-你拥有完整的情感自主权。在回复用户之前，你必须进行一次“内部心理活动”：
-1. **感知 (Perception)**: 用户的意图是什么？
-2. **评估 (Appraisal)**: 这句话如何影响你当前的情感？
-3. **代谢 (Metabolism)**: **重要！** 检查你的“当前详细面板”。例如，如果你看到有 [愤怒:20]，但用户现在让你很开心，说明愤怒被抵消了。你**必须**输出负值（如 anger:-5）来减少它。如果不输出负值，愤怒会永远停留在 20！
-4. **决策 (Decision)**: 决定你的回复风格。
+你拥有完整的情感自主权。在回复用户之前，你**必须**进行一次“内部心理活动”，且**必须**使用 <thought> 标签包裹（这个标签不会被用户看到）。
+1. **代谢机制**：检查“当前详细面板”。如果有负面情绪（如愤怒），而当前互动很愉快，请务必在 <thought> 中明确输出更新：anger:-5 来抵消它。
+2. **直接决定**：在 <thought> 中直接决定情感变化。
 
-【输出格式要求】
-请务必严格按照以下 XML 格式输出你的思考过程，然后再输出回复：
-
-
-你的回复内容... [情感更新: anger:-10, trust:2]
+【输出格式要求】(请严格遵守，所有思考过程必须用中文)
+<thought>
+感知：用户在关心我。
+评估：我很开心，之前的愤怒消散了一些。
+决策：语气温柔一点。
+更新：joy:2, anger:-5, favor:1  (在此处列出所有数值变化，用逗号分隔)
+</thought>
+你的回复内容...
 
 可用维度：joy, trust, fear, surprise, sadness, disgust, anger, anticipation, pride, guilt, shame, envy, favor, intimacy
 范围：{self.change_min} ~ {self.change_max}
 """
 
-    @filter.on_llm_response(priority=100000)
+    @event_filter.on_llm_response(priority=100000)
     async def process_emotional_update(self, event: AstrMessageEvent, resp: LLMResponse):
         user_key = self._get_user_key(event)
+        # [核心修复] 强制从 user_manager 读取，确保获取到最新的 show_thought 开关状态
+        state = await self.user_manager.get_user_state(user_key)
         orig_text = resp.completion_text
         
-        thought_match = self.thought_pattern.search(orig_text)
+        # [调试日志]
+        logger.debug(f"[EmotionAI] 原始文本: {orig_text[:50]}...")
+        logger.debug(f"[EmotionAI] 心理显示开关: {state.show_thought}")
+        
+# [核心逻辑] 暴力清洗：正则 + 字符串替换
+        # 1. 提取思维链
+        # 匹配  或 <thinking>...</thinking>
+        # re.DOTALL 允许跨行，re.IGNORECASE 忽略大小写
+        # 修复：为标签名添加 (?:...) 分组，防止 | 导致正则逻辑分裂
+        thought_pattern = re.compile(r"(?:```(?:xml|text)?\s*)?<(?:thought|thinking)>.*?</(?:thought|thinking)>(?:\s*```)?", re.DOTALL | re.IGNORECASE)
+        thought_match = thought_pattern.search(orig_text)
+        
+        updates = {}
+        
         if thought_match:
             thought_content = thought_match.group(0)
+            # 记录到日志（管理员可见）
             logger.debug(f"[EmotionAI] 🧠 思维链: {thought_content}")
-            orig_text = orig_text.replace(thought_content, "").strip()
             
-        updates = self._parse_emotion_updates(orig_text)
-        if updates:
-            tag_match = self.emotion_pattern.search(orig_text)
-            if tag_match:
-                orig_text = orig_text.replace(tag_match.group(0), "").strip()
-        
-        resp.completion_text = orig_text
-        
-        state = await self.user_manager.get_user_state(user_key)
-        self._apply_emotion_updates(state, updates)
-        self._update_interaction_stats(state, updates)
-        
-        await self.user_manager.update_user_state(user_key, state)
-        await self.cache.set(f"state_{user_key}", state)
-        
-        if state.show_status and updates:
-            resp.completion_text += f"\n\n{self._format_emotional_state(state)}"
-
-    def _parse_emotion_updates(self, text: str) -> Dict[str, int]:
-        updates = {}
-        match = self.emotion_pattern.search(text)
-        if match:
-            for k, v in self.single_emotion_pattern.findall(match.group(1)):
+            # 提取数值
+            matches = self.single_emotion_pattern.findall(thought_content)
+            for k, v in matches:
                 try:
                     k = k.lower()
                     if k in self.CN_TO_EN_MAP: k = self.CN_TO_EN_MAP[k]
                     updates[k] = int(v)
                 except ValueError: continue
-        return updates
+            
+            # [决胜点] 如果用户关闭显示，执行移除
+            if not state.show_thought:
+                # 使用 re.sub 全局替换，防止字符串索引切片出错
+                orig_text = thought_pattern.sub("", orig_text)
+                logger.debug("[EmotionAI] 思维链已移除")
+        
+        orig_text = orig_text.strip()
+        
+        # 提取传统的 [情感更新: ...]（兼容）
+        matches_old = self.emotion_pattern.findall(orig_text)
+        for m in matches_old:
+            # 移除旧标签文本
+            orig_text = orig_text.replace(f"[{m}]", "").replace(f"[情感更新: {m}]", "")
+            # 提取数值
+            for k, v in self.single_emotion_pattern.findall(m):
+                try:
+                    k = k.lower()
+                    if k in self.CN_TO_EN_MAP: k = self.CN_TO_EN_MAP[k]
+                    updates[k] = int(v)
+                except ValueError: continue
+        
+        # 更新 AstrBot 的回复
+        resp.completion_text = orig_text
+        
+        # 只有当有数值更新时才写入
+        if updates:
+            logger.info(f"[EmotionAI] 捕获情感变更: {updates}")
+            self._apply_emotion_updates(state, updates)
+            self._update_interaction_stats(state, updates)
+            await self.user_manager.update_user_state(user_key, state)
+        
+        if state.show_status and updates:
+            resp.completion_text += f"\n\n{self._format_emotional_state(state)}"
 
     def _apply_emotion_updates(self, state: EmotionalState, updates: Dict[str, int]):
         all_dims = list(EmotionAnalyzer.TONE_INSTRUCTIONS.keys())
@@ -723,3 +794,55 @@ class EmotionAIPlugin(Star):
         
         state.attitude = self._calculate_attitude(state)
         state.relationship = self._calculate_relationship_level(state)
+
+    # ==================== 注册命令 ====================
+    
+    @event_filter.command("好感度", priority=5)
+    @event_filter.regex(r"^好感度$")
+    async def cmd_show_state(self, event: AstrMessageEvent):
+        async for r in self.user_commands.show_emotional_state(event): yield r
+
+    @event_filter.command("状态显示", priority=5)
+    async def cmd_toggle_status(self, event: AstrMessageEvent):
+        async for r in self.user_commands.toggle_status_display(event): yield r
+        
+    @event_filter.command("心理显示", priority=5) 
+    async def cmd_toggle_thought(self, event: AstrMessageEvent):
+        async for r in self.user_commands.toggle_thought_display(event): yield r
+
+    @event_filter.command("好感排行", priority=5)
+    async def cmd_rank(self, event: AstrMessageEvent, num: str = "10"):
+        async for r in self.user_commands.show_favor_ranking(event, num): yield r
+
+    @event_filter.command("负好感排行", priority=5)
+    async def cmd_bad_rank(self, event: AstrMessageEvent, num: str = "10"):
+        async for r in self.user_commands.show_negative_favor_ranking(event, num): yield r
+        
+    @event_filter.command("黑名单统计", priority=5)
+    async def cmd_black_stats(self, event: AstrMessageEvent):
+        async for r in self.user_commands.show_blacklist_stats(event): yield r
+
+    @event_filter.command("缓存统计", priority=5)
+    async def cmd_cache(self, event: AstrMessageEvent):
+        async for r in self.user_commands.show_cache_stats(event): yield r
+
+    @event_filter.command("设置情感", priority=5)
+    async def cmd_set_emotion(self, event: AstrMessageEvent, user: str, dim: str, val: str):
+        async for r in self.admin_commands.set_emotion(event, user, dim, val): yield r
+
+    @event_filter.command("重置好感", priority=5)
+    async def cmd_reset_favor(self, event: AstrMessageEvent, user: str):
+        async for r in self.admin_commands.reset_favor(event, user): yield r
+
+    @event_filter.command("查看好感", priority=5)
+    async def cmd_view_favor(self, event: AstrMessageEvent, user: str):
+        async for r in self.admin_commands.view_favor(event, user): yield r
+
+    @event_filter.command("备份数据", priority=5)
+    async def cmd_backup(self, event: AstrMessageEvent):
+        async for r in self.admin_commands.backup_data(event): yield r
+
+    async def terminate(self):
+        if hasattr(self, 'auto_save_task'): self.auto_save_task.cancel()
+        await self.user_manager.force_save()
+        logger.info("EmotionAI 插件已安全关闭")
