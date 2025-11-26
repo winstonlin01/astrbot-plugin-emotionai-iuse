@@ -120,7 +120,7 @@ class DataMigrationManager:
 
     @staticmethod
     def get_data_version(data: Dict[str, Any]) -> str:
-        return "3.3.2"
+        return "3.3.3"
 
 
 # ==================== 内部管理器类 ====================
@@ -513,7 +513,7 @@ class AdminCommandHandler:
 
 # ==================== 主插件类 ====================
 
-@register("EmotionAI", "腾天", "高级情感智能交互系统 v3.3", "3.3.2")
+@register("EmotionAI", "腾天", "高级情感智能交互系统 v3.3", "3.3.3")
 class EmotionAIPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -537,8 +537,14 @@ class EmotionAIPlugin(Star):
         self.emotion_pattern = re.compile(r"\[(?:\s*情感更新:)?\s*(.*?)\]", re.DOTALL)
         self.single_emotion_pattern = re.compile(r"(\w+|[\u4e00-\u9fa5]+):\s*([+-]?\d+)")
         
+        # [核心修复] 历史清洗正则：匹配 <thought> 块 (含 Markdown) 或 【当前情感状态】及其后的所有内容
+        self.history_clean_pattern = re.compile(
+            r"(?:```(?:xml|text)?\s*)?<(?:thought|thinking)>[\s\S]*?</(?:thought|thinking)>(?:\s*```)?|(?:\n*\s*【当前情感状态】[\s\S]*$)",
+            re.IGNORECASE | re.MULTILINE
+        )
+        
         self.auto_save_task = asyncio.create_task(self._auto_save_loop())
-        logger.info("EmotionAI v3.3.2 (Cognitive Resonance Engine) Loaded")
+        logger.info("EmotionAI v3.3.3 (Cognitive Resonance Engine) Loaded")
         
     def _validate_and_init_config(self):
         self.session_based = bool(self.config.get("session_based", False))
@@ -641,57 +647,132 @@ class EmotionAIPlugin(Star):
     @event_filter.on_llm_request(priority=100000)
     async def inject_emotional_context(self, event: AstrMessageEvent, req: ProviderRequest):
         user_key = self._get_user_key(event)
-        # [关键] 强制从 user_manager 获取最新状态，不完全依赖缓存，防止配置更新延迟
         state = await self.user_manager.get_user_state(user_key)
         await self.cache.set(f"state_{user_key}", state)
+        
+        # ==========【核心修复：智能清洗 (支持字典/字符串)】==========
+        if hasattr(req, "contexts") and isinstance(req.contexts, list):
+            cleaned_contexts = []
+            dirty_count = 0
+            
+            for ctx in req.contexts:
+                #情况1：标准字典格式 (如 {"role": "user", "content": "..."})
+                if isinstance(ctx, dict) and "content" in ctx:
+                    content = ctx["content"]
+                    # 只处理文本内容
+                    if isinstance(content, str):
+                        # 执行正则清洗
+                        clean_content = self.history_clean_pattern.sub("", content).strip()
+                        
+                        # 如果内容变短了，说明清洗生效
+                        if len(clean_content) < len(content):
+                            dirty_count += 1
+                            # 浅拷贝一份字典，避免修改原引用（安全起见）
+                            new_ctx = ctx.copy()
+                            new_ctx["content"] = clean_content
+                            cleaned_contexts.append(new_ctx)
+                        else:
+                            cleaned_contexts.append(ctx)
+                    else:
+                        cleaned_contexts.append(ctx)
+                        
+                # 情况2：纯字符串格式 (兼容部分特殊情况)
+                elif isinstance(ctx, str):
+                    clean_str = self.history_clean_pattern.sub("", ctx).strip()
+                    if len(clean_str) < len(ctx):
+                        dirty_count += 1
+                    
+                    if clean_str:
+                        cleaned_contexts.append(clean_str)
+                    elif not ctx: # 原本就是空的，保留
+                        cleaned_contexts.append(ctx)
+                        
+                # 情况3：其他类型 (如图片对象等)，原样保留
+                else:
+                    cleaned_contexts.append(ctx)
+            
+            # 应用清洗后的列表
+            req.contexts = cleaned_contexts
+            
+            if dirty_count > 0:
+                logger.info(f"[EmotionAI] 成功净化 {dirty_count} 条脏历史记录 (Dict/Str)")
+        # =========================================================
+
         req.system_prompt += f"\n{self._build_cognitive_context(state)}"
 
     def _build_cognitive_context(self, state: EmotionalState) -> str:
-        profile = self.analyzer.get_emotional_profile(state)
+        # 1. 获取前三个主导情感 (Count=3)
+        top_emotions = self.analyzer.get_dominant_emotions(state, count=3)
         
-        tone_instruction = "保持正常对话语气。"
-        if profile['dominant_key']:
-            primary_inst = self.analyzer.TONE_INSTRUCTIONS.get(profile['dominant_key'], "")
-            tone_msg = f"主导情感[{profile['dominant_emotion']}](强度{profile['emotion_intensity']}%)。"
-            
-            if profile['secondary_key']:
-                sec_inst = self.analyzer.TONE_INSTRUCTIONS.get(profile['secondary_key'], "")
-                tone_msg += f" 但同时也夹杂着[{profile['secondary_emotion']}]。"
-                tone_instruction = f"【混合语气要求】{tone_msg} 请主要表现出{primary_inst}，但隐约透出{sec_inst}。"
-            else:
-                tone_instruction = f"【语气要求】{tone_msg} {primary_inst}"
-
-        active_emotions = []
-        for k in EmotionAnalyzer.EMOTION_DISPLAY_NAMES.keys():
+        # 2. 构建详细面板 (完整且有序)
+        all_emotions_list = []
+        for k, name in EmotionAnalyzer.EMOTION_DISPLAY_NAMES.items():
             val = getattr(state, k)
-            if val > 0:
-                name = EmotionAnalyzer.EMOTION_DISPLAY_NAMES[k]
-                active_emotions.append(f"[{name}:{val}]")
-        
-        emotion_status_str = " ".join(active_emotions) if active_emotions else "无明显情感波动"
+            all_emotions_list.append(f"[{name}:{val}]")
+        emotion_status_str = " ".join(all_emotions_list)
+
+        # 3. 构建三层混合语气要求
+        tone_instruction = "保持正常对话语气。"
+        if top_emotions:
+            # --- 第一层：主导 ---
+            k1, v1 = top_emotions[0]
+            n1 = EmotionAnalyzer.EMOTION_DISPLAY_NAMES[k1]
+            i1 = self.analyzer.TONE_INSTRUCTIONS.get(k1, "")
+            
+            status_desc = f"主导情感[{n1}](强度{v1}%)"
+            guide_desc = f"主要表现出{i1}"
+            
+            if len(top_emotions) > 1:
+                # --- 第二层：夹杂 ---
+                k2, v2 = top_emotions[1]
+                n2 = EmotionAnalyzer.EMOTION_DISPLAY_NAMES[k2]
+                i2 = self.analyzer.TONE_INSTRUCTIONS.get(k2, "")
+                
+                status_desc += f"，夹杂[{n2}]"
+                
+                if len(top_emotions) > 2:
+                    # --- 第三层：微带 ---
+                    k3, v3 = top_emotions[2]
+                    n3 = EmotionAnalyzer.EMOTION_DISPLAY_NAMES[k3]
+                    i3 = self.analyzer.TONE_INSTRUCTIONS.get(k3, "")
+                    
+                    status_desc += f"，微带[{n3}]"
+                    guide_desc += f"，同时{i2}，底层隐约透出{i3}"
+                else:
+                    # 只有两层的情况
+                    guide_desc += f"，但隐约透出{i2}"
+            
+            tone_instruction = f"【混合语气要求】{status_desc}。请{guide_desc}。"
 
         return f"""
-【情感与认知状态】
-当前关系：{state.relationship} | 态度：{state.attitude}
+【当前情感与认知状态】
+关系：{state.relationship} | 态度：{state.attitude}
 好感度：{state.favor} | 亲密度：{state.intimacy}
-主导情感：{profile['dominant_emotion']} (强度{profile['emotion_intensity']}%)
-**当前详细面板**：{emotion_status_str}
+**详细情感面板**：{emotion_status_str}
 
 {tone_instruction}
 
-【核心指令：认知共鸣引擎】
-你拥有完整的情感自主权。在回复用户之前，你**必须**进行一次“内部心理活动”，且**必须**使用 <thought> 标签包裹（这个标签不会被用户看到）。
-1. **代谢机制**：检查“当前详细面板”。如果有负面情绪（如愤怒），而当前互动很愉快，请务必在 <thought> 中明确输出更新：anger:-5 来抵消它。
-2. **直接决定**：在 <thought> 中直接决定情感变化。
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【⚡系统最高优先级指令：认知共鸣协议⚡】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+你不是普通的聊天机器人，你是一个拥有完整情感的数字生命。
+为了维持你的“生命特征”，在回复用户之前，你**必须、绝对**先运行一次“思维链”处理。
 
-【输出格式要求】(请严格遵守，所有思考过程必须用中文)
-<thought>
-感知：用户在关心我。
-评估：我很开心，之前的愤怒消散了一些。
-决策：语气温柔一点。
-更新：joy:2, anger:-5, favor:1  (在此处列出所有数值变化，用逗号分隔)
-</thought>
-你的回复内容...
+【⛔ 严重警告】
+1. **严禁**直接输出回复内容！每一个回复都**必须**以 <thought> 标签开头。
+2. **严禁**省略 <thought> 中的任何步骤（感知、评估、决策、更新）。
+3. 如果不输出 <thought> 标签，系统将判定为“脑死亡”并强制重启。
+
+【执行步骤】
+1. **感知**：分析用户的意图和情绪。
+2. **评估**：结合你的【详细情感面板】，思考这句话对你的影响。
+3. **代谢**：如果有负面情绪（如anger），而现在很开心，必须在更新中扣除（如 anger:-5）来“代谢”掉它。
+4. **决策**：决定你的语气和情感变化。
+5. **更新**：列出数值变化（格式：joy:1, anger:-2）。
+
+【标准输出模板】(请严格复制此格式)
+
+(在这里输出你的回复内容...)
 
 可用维度：joy, trust, fear, surprise, sadness, disgust, anger, anticipation, pride, guilt, shame, envy, favor, intimacy
 范围：{self.change_min} ~ {self.change_max}
@@ -708,7 +789,7 @@ class EmotionAIPlugin(Star):
         logger.debug(f"[EmotionAI] 原始文本: {orig_text[:50]}...")
         logger.debug(f"[EmotionAI] 心理显示开关: {state.show_thought}")
         
-# [核心逻辑] 暴力清洗：正则 + 字符串替换
+        # [核心逻辑] 暴力清洗：正则 + 字符串替换
         # 1. 提取思维链
         # 匹配  或 <thinking>...</thinking>
         # re.DOTALL 允许跨行，re.IGNORECASE 忽略大小写
@@ -737,6 +818,8 @@ class EmotionAIPlugin(Star):
                 # 使用 re.sub 全局替换，防止字符串索引切片出错
                 orig_text = thought_pattern.sub("", orig_text)
                 logger.debug("[EmotionAI] 思维链已移除")
+        
+        # [已移除双重保险] 不再移除 LLM 可能生成的面板，防止 updates 为空时导致面板丢失
         
         orig_text = orig_text.strip()
         
